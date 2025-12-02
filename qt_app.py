@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer
 
-from app.audio_engine import AudioEngine, PlaybackState
+from app.audio_engine import AudioEngine, PlaybackState  # our engine
 
 
 class MainWindow(QMainWindow):
@@ -26,28 +26,37 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Bit-Perfect Player (PyQt6)")
         self.setMinimumSize(900, 550)
 
-        # Core audio engine
+        # -------- Core audio engine --------
         self.engine = AudioEngine()
 
-        # UI elements
+        # -------- UI widgets --------
         self.track_list = QListWidget()
         self.now_playing_label = QLabel("Now Playing: –")
         self.state_label = QLabel("State: Idle")
 
+        # ALSA device selector
+        self.device_label = QLabel("Output device:")
+        self.device_combo = QComboBox()
+
+        # Playback controls
         self.play_button = QPushButton("Play")
         self.pause_button = QPushButton("Pause")
         self.stop_button = QPushButton("Stop")
 
         self._selected_track_id = None
 
+        # Build UI & connect signals
         self._setup_ui()
         self._connect_signals()
         self._load_tracks()
+        self._load_devices()
 
         # Periodic status refresh
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.update_status)
         self.status_timer.start(500)  # every 500 ms
+
+    # ---------- UI setup ----------
 
     def _setup_ui(self):
         central = QWidget()
@@ -61,7 +70,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("Library"))
         left_layout.addWidget(self.track_list)
 
-        # Right: now playing + controls
+        # Right: now playing + device + controls
         right_layout = QVBoxLayout()
         right_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -71,12 +80,20 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet("color: gray;")
         right_layout.addWidget(self.state_label)
 
+        # Device selector row
+        device_row = QHBoxLayout()
+        device_row.addWidget(self.device_label)
+        device_row.addWidget(self.device_combo)
+        right_layout.addLayout(device_row)
+
+        # Playback controls
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.pause_button)
         controls_layout.addWidget(self.stop_button)
         right_layout.addLayout(controls_layout)
 
+        # Put left + right together
         main_layout.addLayout(left_layout, 2)
         main_layout.addLayout(right_layout, 1)
 
@@ -85,21 +102,47 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self.on_play_clicked)
         self.pause_button.clicked.connect(self.on_pause_clicked)
         self.stop_button.clicked.connect(self.on_stop_clicked)
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+
+    # ---------- Data loading ----------
 
     def _load_tracks(self):
         self.track_list.clear()
         tracks = self.engine.list_tracks()
         if not tracks:
-            QMessageBox.warning(self, "No tracks", "No FLAC/WAV files found in your music directory.")
+            QMessageBox.warning(
+                self,
+                "No tracks",
+                "No FLAC/WAV files found in your music directory.",
+            )
             return
 
         for t in tracks:
             item = QListWidgetItem(f"[{t.id}] {t.name}")
-            # store track id on the item
             item.setData(Qt.ItemDataRole.UserRole, t.id)
             self.track_list.addItem(item)
 
-    # ---------- UI event handlers ----------
+    def _load_devices(self):
+        self.device_combo.clear()
+        devices = self.engine.list_alsa_devices()
+        if not devices:
+            self.device_combo.addItem("No ALSA hw devices found", userData=None)
+            self.device_combo.setEnabled(False)
+            return
+
+        current_card = self.engine.status().get("alsa_card")
+
+        for dev in devices:
+            display = f'{dev["name"]} ({dev["id"]})'
+            self.device_combo.addItem(display, userData=dev["id"])
+
+        # Try to set selection to current alsa_card
+        if current_card:
+            index = self.device_combo.findData(current_card)
+            if index >= 0:
+                self.device_combo.setCurrentIndex(index)
+
+    # ---------- Event handlers ----------
 
     def on_track_double_clicked(self, item: QListWidgetItem):
         track_id = item.data(Qt.ItemDataRole.UserRole)
@@ -109,7 +152,11 @@ class MainWindow(QMainWindow):
     def on_play_clicked(self):
         item = self.track_list.currentItem()
         if item is None:
-            QMessageBox.information(self, "No track selected", "Please select a track from the list.")
+            QMessageBox.information(
+                self,
+                "No track selected",
+                "Please select a track from the list.",
+            )
             return
         track_id = item.data(Qt.ItemDataRole.UserRole)
         self._selected_track_id = track_id
@@ -121,18 +168,29 @@ class MainWindow(QMainWindow):
     def on_stop_clicked(self):
         self.engine.stop()
 
+    def on_device_changed(self, index: int):
+        device_id = self.device_combo.currentData()
+        if not device_id:
+            return
+        # Change ALSA output device in the engine
+        self.engine.set_output_device(device_id)
+        # Optional: update status label
+        self.state_label.setText(f"State: Idle (output: {device_id})")
+        self.state_label.setStyleSheet("color: gray;")
+
     def play_track(self, track_id: int):
         try:
             self.engine.play(track_id)
         except ValueError as e:
             QMessageBox.critical(self, "Playback error", str(e))
 
+    # ---------- Status updates ----------
+
     def update_status(self):
         status = self.engine.status()
         state = status["state"]
         current_name = status["current_track"]
 
-        # Update labels
         if current_name:
             self.now_playing_label.setText(f"Now Playing: {current_name}")
         else:
@@ -148,7 +206,10 @@ class MainWindow(QMainWindow):
             self.state_label.setText("State: Stopped")
             self.state_label.setStyleSheet("color: gray;")
         else:
-            self.state_label.setText("State: Idle")
+            # idle
+            # don't overwrite device info if we set it in on_device_changed
+            if "output:" not in self.state_label.text():
+                self.state_label.setText("State: Idle")
             self.state_label.setStyleSheet("color: gray;")
 
 
