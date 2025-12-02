@@ -143,6 +143,7 @@ class PlaybackState:
 class AudioEngine:
     """
     Bit-perfect playback via ALSA + soundfile; dynamic music_dir and ALSA selection.
+    Adds position tracking and seeking support.
     """
     def __init__(self, music_dir: str = MUSIC_DIR, alsa_card: str = ALSA_CARD):
         self.music_dir = music_dir
@@ -154,6 +155,12 @@ class AudioEngine:
         self._playback_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+
+        # Seeking and position vars (thread-safe via _lock)
+        self._position: float = 0.0         # seconds (updated by playback thread)
+        self._duration: float = 0.0         # seconds (from track)
+        self._seek_to_seconds: Optional[float] = None  # None or seconds target
+        self._seek_lock = threading.Lock()
 
         self._state = PlaybackState.IDLE
         self._lock = threading.Lock()
@@ -206,19 +213,27 @@ class AudioEngine:
             raise ValueError("Track not found")
 
         with self._lock:
+            # request stop of any running playback (do NOT join here to avoid blocking GUI)
             self._stop_event.set()
-            if self._playback_thread and self._playback_thread.is_alive():
-                self._playback_thread.join()
 
+            # reset stop / pause states & seeking for the new playback
             self._stop_event.clear()
             self._pause_event.clear()
+            with self._seek_lock:
+                self._seek_to_seconds = None
 
             self.current_track = track
             self._state = PlaybackState.PLAYING
 
+            # set duration when available
+            self._duration = float(track.duration) if (track.duration is not None) else 0.0
+            self._position = 0.0
+
             print(f"[audio_engine] Starting playback id={track.id} path={track.path} device={self.alsa_card}", flush=True)
+            # start a new playback thread and do NOT block the caller
             self._playback_thread = threading.Thread(target=self._playback_loop, args=(track.path,), daemon=True)
             self._playback_thread.start()
+
 
     def pause(self):
         with self._lock:
@@ -237,8 +252,34 @@ class AudioEngine:
             self._stop_event.set()
             self._pause_event.clear()
             self._state = PlaybackState.STOPPED
-        if self._playback_thread and self._playback_thread.is_alive():
-            self._playback_thread.join()
+        # Do not join() here from the main thread to avoid UI freeze.
+        # The playback thread will exit on its own and clean up.
+
+
+    # Seeking API (thread-safe)
+    def seek(self, seconds: float):
+        """
+        Request a seek to a position (seconds). This is thread-safe and applied
+        in the playback loop on next iteration.
+        """
+        with self._seek_lock:
+            self._seek_to_seconds = float(max(0.0, seconds))
+        # update external position immediately for a responsive UI
+        with self._lock:
+            self._position = float(max(0.0, seconds))
+
+    def get_position(self) -> float:
+        with self._lock:
+            return float(self._position)
+
+    def get_duration(self) -> float:
+        with self._lock:
+            # fall back to track info
+            if self._duration and self._duration > 0:
+                return float(self._duration)
+            if self.current_track and self.current_track.duration:
+                return float(self.current_track.duration)
+            return 0.0
 
     # ---------- Playback loop ----------
     def _map_subtype_to_alsa_format(self, subtype: str):
@@ -268,14 +309,64 @@ class AudioEngine:
                 samplerate = f.samplerate
                 subtype = f.subtype
 
+                # Set duration & sample metadata (redundant but keeps state accurate)
+                frames_total = getattr(f, "frames", None)
+                if frames_total and samplerate:
+                    with self._lock:
+                        self._duration = float(frames_total) / float(samplerate)
+
                 print(f"[audio_engine] File info: channels={channels}, samplerate={samplerate}, subtype={subtype}", flush=True)
                 alsa_format, np_dtype = self._map_subtype_to_alsa_format(subtype)
-                pcm = self._open_alsa_device(channels, samplerate, alsa_format)
+                # try opening ALSA device; if device busy, retry a few times (the retries are inside playback thread)
+                pcm = None
+                max_retries = 6
+                for attempt in range(max_retries):
+                    try:
+                        pcm = self._open_alsa_device(channels, samplerate, alsa_format)
+                        break
+                    except Exception as e:
+                        print(f"[audio_engine] ALSA open failed (attempt {attempt+1}/{max_retries}): {e}", flush=True)
+                        time.sleep(0.05)  # short retry delay - only affects playback thread
+                if pcm is None:
+                    raise RuntimeError("Unable to open ALSA device for playback")
 
+
+                # Apply any pending seek at start
+                with self._seek_lock:
+                    seek_secs = self._seek_to_seconds
+                    self._seek_to_seconds = None
+                if seek_secs is not None:
+                    target_frame = int(seek_secs * samplerate)
+                    target_frame = max(0, min(target_frame, frames_total or target_frame))
+                    try:
+                        f.seek(target_frame)
+                        with self._lock:
+                            self._position = float(target_frame) / float(samplerate)
+                    except Exception as e:
+                        print("[audio_engine] seek failed at start:", e, flush=True)
+
+                # Main playback loop
                 while not self._stop_event.is_set():
+                    # handle pause
                     if self._pause_event.is_set():
                         time.sleep(0.05)
                         continue
+
+                    # handle seek requests (from main thread)
+                    with self._seek_lock:
+                        seek_secs = self._seek_to_seconds
+                        self._seek_to_seconds = None
+                    if seek_secs is not None:
+                        try:
+                            target_frame = int(seek_secs * samplerate)
+                            if frames_total:
+                                target_frame = max(0, min(target_frame, frames_total - 1))
+                            f.seek(target_frame)
+                            with self._lock:
+                                self._position = float(target_frame) / float(samplerate)
+                            # continue loop to read from new position
+                        except Exception as e:
+                            print("[audio_engine] seek error:", e, flush=True)
 
                     data = f.read(frames=BUFFER_FRAMES, dtype=np_dtype, always_2d=True)
                     if len(data) == 0:
@@ -284,6 +375,13 @@ class AudioEngine:
 
                     interleaved = data.reshape(-1)
                     pcm.write(interleaved.tobytes())
+
+                    # update position after write
+                    try:
+                        with self._lock:
+                            self._position = float(f.tell()) / float(samplerate)
+                    except Exception:
+                        pass
 
         except Exception as e:
             import traceback
@@ -294,6 +392,7 @@ class AudioEngine:
                 if not self._stop_event.is_set():
                     self._state = PlaybackState.IDLE
                 self.current_track = None
+                self._position = 0.0
             print("[audio_engine] Playback loop finished", flush=True)
 
     # ---------- Status ----------
@@ -305,4 +404,6 @@ class AudioEngine:
                 "current_track_id": self.current_track.id if self.current_track else None,
                 "alsa_card": self.alsa_card,
                 "music_dir": self.music_dir,
+                "position": float(self._position),
+                "duration": float(self._duration),
             }
