@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
 import sys
+import os
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
     QWidget,
-    QListWidget,
-    QListWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QPushButton,
     QLabel,
     QVBoxLayout,
     QHBoxLayout,
     QMessageBox,
     QComboBox,
+    QFileDialog,
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QPixmap, QImage
-from app.audio_engine import AudioEngine, PlaybackState 
+from PyQt6.QtGui import QPixmap, QImage, QAction, QFont
+
+from app.audio_engine import AudioEngine, PlaybackState
+
+
+def format_seconds(sec: Optional[float]) -> str:
+    if sec is None:
+        return "–"
+    try:
+        s = int(round(sec))
+        m = s // 60
+        s = s % 60
+        return f"{m}:{s:02d}"
+    except Exception:
+        return "–"
 
 
 class MainWindow(QMainWindow):
@@ -24,17 +40,22 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Bit-Perfect Player (PyQt6)")
-        self.setMinimumSize(900, 550)
+        self.setMinimumSize(1000, 600)
 
-        # -------- Core audio engine --------
+        # Engine
         self.engine = AudioEngine()
 
-        # -------- UI widgets --------
-        self.track_list = QListWidget()
+        # Widgets
+        self.tree = QTreeWidget()
+        # two columns: name, length
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Name", "Length"])
+        self.tree.setColumnWidth(0, 450)
+
         self.now_playing_label = QLabel("Now Playing: –")
         self.state_label = QLabel("State: Idle")
 
-        # NEW: album art + metadata widgets
+        # Album art + metadata
         self.art_label = QLabel()
         self.art_label.setFixedSize(200, 200)
         self.art_label.setStyleSheet("background: #111; border: 1px solid #333;")
@@ -45,30 +66,71 @@ class MainWindow(QMainWindow):
         self.meta_album = QLabel("Album: –")
         self.meta_info = QLabel("Format: –")
 
-        # ALSA device selector
-        self.device_label = QLabel("Output device:")
+        # Device combo + controls
         self.device_combo = QComboBox()
-
-        # Playback controls
         self.play_button = QPushButton("Play")
         self.pause_button = QPushButton("Pause")
         self.stop_button = QPushButton("Stop")
 
-        self._selected_track_id = None
+        # Menu
+        self._create_menu_bar()
 
-        # Build UI & connect signals
+        # Make menu bar bigger / more prominent using stylesheet
+        self.menuBar().setStyleSheet("""
+            QMenuBar {
+                font-size: 16px;
+                padding: 6px 12px;
+                spacing: 20px;
+                background: #0b1220;
+                color: #e6eef6;
+            }
+            QMenuBar::item {
+                padding: 8px 16px;
+                background: transparent;
+            }
+            QMenuBar::item:selected {
+                background: #1f2a44;
+            }
+            QMenu {
+                font-size: 14px;
+            }
+        """)
+
+        # Layout
         self._setup_ui()
         self._connect_signals()
-        self._load_tracks()
+
+        # Load data
+        self._load_tracks_tree()
         self._load_devices()
 
-        # Periodic status refresh
-        self.status_timer = QTimer(self)
-        self.status_timer.timeout.connect(self.update_status)
-        self.status_timer.start(500)  # every 500 ms
+        # Status timer
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_status)
+        self.timer.start(500)
 
-    # ---------- UI setup ----------
+    # ---------------- Menu ----------------
+    def _create_menu_bar(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("&File")
 
+        import_action = QAction("Import folder", self)
+        import_action.setShortcut("Ctrl+O")
+        import_action.triggered.connect(self.on_import_folder)
+        file_menu.addAction(import_action)
+
+        rescan_action = QAction("Rescan library", self)
+        rescan_action.setShortcut("Ctrl+R")
+        rescan_action.triggered.connect(self.on_rescan)
+        file_menu.addAction(rescan_action)
+
+        file_menu.addSeparator()
+        quit_action = QAction("Quit", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+    # ---------------- UI ----------------
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -76,12 +138,12 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout()
         central.setLayout(main_layout)
 
-        # Left: track list
+        # left: tree
         left_layout = QVBoxLayout()
-        left_layout.addWidget(QLabel("Library"))
-        left_layout.addWidget(self.track_list)
+        left_layout.addWidget(QLabel("Library (folder structure)"))
+        left_layout.addWidget(self.tree)
 
-        # Right: now playing + art + metadata + device + controls
+        # right: now playing + art + metadata + device + controls
         right_layout = QVBoxLayout()
         right_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -91,94 +153,172 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet("color: gray;")
         right_layout.addWidget(self.state_label)
 
-        # NEW: album art + metadata block
         right_layout.addWidget(self.art_label)
         right_layout.addWidget(self.meta_title)
         right_layout.addWidget(self.meta_artist)
         right_layout.addWidget(self.meta_album)
         right_layout.addWidget(self.meta_info)
 
-        # Device selector row
-        device_row = QHBoxLayout()
-        device_row.addWidget(self.device_label)
-        device_row.addWidget(self.device_combo)
-        right_layout.addLayout(device_row)
+        dev_row = QHBoxLayout()
+        dev_row.addWidget(QLabel("Output device:"))
+        dev_row.addWidget(self.device_combo)
+        right_layout.addLayout(dev_row)
 
-        controls_layout = QHBoxLayout()
-        controls_layout.addWidget(self.play_button)
-        controls_layout.addWidget(self.pause_button)
-        controls_layout.addWidget(self.stop_button)
-        right_layout.addLayout(controls_layout)
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(self.play_button)
+        ctrl_row.addWidget(self.pause_button)
+        ctrl_row.addWidget(self.stop_button)
+        right_layout.addLayout(ctrl_row)
 
         main_layout.addLayout(left_layout, 2)
         main_layout.addLayout(right_layout, 1)
 
-
+    # ---------------- Signals ----------------
     def _connect_signals(self):
-        self.track_list.itemDoubleClicked.connect(self.on_track_double_clicked)
+        self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
         self.play_button.clicked.connect(self.on_play_clicked)
         self.pause_button.clicked.connect(self.on_pause_clicked)
         self.stop_button.clicked.connect(self.on_stop_clicked)
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
 
-    # ---------- Data loading ----------
+    # ---------------- Tree styling helper ----------------
+    def style_tree_item(self, item: QTreeWidgetItem, level: int):
+        """
+        level = 0 → top-level folder
+        level = 1 → subfolder
+        level >=2 → files / deeper levels
+        """
+        f = QFont()
+        if level == 0:
+            f.setPointSize(14)
+            f.setBold(True)
+        elif level == 1:
+            f.setPointSize(12)
+            f.setBold(True)
+        else:
+            f.setPointSize(10)
+            f.setBold(False)
 
-    def _load_tracks(self):
-        self.track_list.clear()
+        item.setFont(0, f)
+        item.setFont(1, f)
+
+    # ---------------- Load / build tree ----------------
+    def _load_tracks_tree(self):
+        """
+        Build a QTreeWidget mirroring the folder structure under music_dir.
+        Folders become top/inner nodes; files are leaf nodes with length column.
+        """
+        self.tree.clear()
         tracks = self.engine.list_tracks()
         if not tracks:
-            QMessageBox.warning(
-                self,
-                "No tracks",
-                "No FLAC/WAV files found in your music directory.",
-            )
             return
+
+        root_map = {}  # maps folder path -> QTreeWidgetItem
+
+        base = os.path.abspath(self.engine.music_dir)
 
         for t in tracks:
-            display_name = f"{t.title} — {t.artist}" if t.title else t.name
-            item = QListWidgetItem(display_name)
-            item.setData(Qt.ItemDataRole.UserRole, t.id)
-            self.track_list.addItem(item)
+            # relative path from music_dir
+            try:
+                rel = os.path.relpath(t.path, base)
+            except Exception:
+                rel = t.path
+            parts = rel.split(os.sep)
+            # build or find parent node
+            parent = None
+            path_acc = base
+            for i, part in enumerate(parts[:-1]):  # all folder parts
+                path_acc = os.path.join(path_acc, part)
+                if path_acc not in root_map:
+                    node = QTreeWidgetItem([part, ""])
+                    node.setData(0, Qt.ItemDataRole.UserRole, {"type": "dir", "path": path_acc})
+                    root_map[path_acc] = node
+                    # attach to parent or top-level
+                    if parent is None:
+                        self.tree.addTopLevelItem(node)
+                        self.style_tree_item(node, level=0)
+                    else:
+                        parent.addChild(node)
+                        # level = depth of this folder relative to base
+                        depth = len(parts[:i+1]) - 1
+                        self.style_tree_item(node, level=depth if depth >= 0 else 1)
+                    parent = node
+                else:
+                    parent = root_map[path_acc]
 
+            # now add the file node under parent (or top-level if no parent)
+            name = parts[-1]
+            length = format_seconds(t.duration)
+            file_item = QTreeWidgetItem([name, length])
+            file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "file", "track_id": t.id, "path": t.path})
+            # style file item as deeper level
+            self.style_tree_item(file_item, level=2)
+            if parent is None:
+                self.tree.addTopLevelItem(file_item)
+            else:
+                parent.addChild(file_item)
+
+        # expand top level folders for convenience
+        for i in range(self.tree.topLevelItemCount()):
+            self.tree.topLevelItem(i).setExpanded(True)
+
+    # ---------------- Devices ----------------
     def _load_devices(self):
         self.device_combo.clear()
-        devices = self.engine.list_alsa_devices()
-        if not devices:
-            self.device_combo.addItem("No ALSA hw devices found", userData=None)
+        devs = self.engine.list_alsa_devices()
+        if not devs:
+            self.device_combo.addItem("No ALSA hw devices", userData=None)
             self.device_combo.setEnabled(False)
             return
+        for d in devs:
+            label = f"{d['name']} ({d['id']})"
+            self.device_combo.addItem(label, userData=d["id"])
+        # select current if present
+        cur = self.engine.status().get("alsa_card")
+        if cur:
+            idx = self.device_combo.findData(cur)
+            if idx >= 0:
+                self.device_combo.setCurrentIndex(idx)
 
-        current_card = self.engine.status().get("alsa_card")
+    # ---------------- Actions ----------------
+    def on_import_folder(self):
+        initial = self.engine.status().get("music_dir") or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(self, "Select primary music folder", initial)
+        if not folder:
+            return
+        self.engine.set_music_dir(folder)
+        self._load_tracks_tree()
+        self._load_devices()
+        self.now_playing_label.setText("Now Playing: –")
+        self._clear_metadata()
+        self.state_label.setText(f"State: Idle (library: {folder})")
+        self.state_label.setStyleSheet("color: gray;")
 
-        for dev in devices:
-            display = f'{dev["name"]} ({dev["id"]})'
-            self.device_combo.addItem(display, userData=dev["id"])
+    def on_rescan(self):
+        self.engine._scan_library()
+        self._load_tracks_tree()
+        QMessageBox.information(self, "Rescan", "Library rescan complete.")
 
-        # Try to set selection to current alsa_card
-        if current_card:
-            index = self.device_combo.findData(current_card)
-            if index >= 0:
-                self.device_combo.setCurrentIndex(index)
-
-    # ---------- Event handlers ----------
-
-    def on_track_double_clicked(self, item: QListWidgetItem):
-        track_id = item.data(Qt.ItemDataRole.UserRole)
-        self._selected_track_id = track_id
-        self.play_track(track_id)
+    def on_tree_double_click(self, item: QTreeWidgetItem, col: int):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        if data.get("type") == "file":
+            track_id = data.get("track_id")
+            if track_id is not None:
+                self.play_track(track_id)
 
     def on_play_clicked(self):
-        item = self.track_list.currentItem()
-        if item is None:
-            QMessageBox.information(
-                self,
-                "No track selected",
-                "Please select a track from the list.",
-            )
+        sel = self.tree.currentItem()
+        if not sel:
+            QMessageBox.information(self, "No selection", "Select a track to play.")
             return
-        track_id = item.data(Qt.ItemDataRole.UserRole)
-        self._selected_track_id = track_id
-        self.play_track(track_id)
+        data = sel.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get("type") != "file":
+            QMessageBox.information(self, "Select a file", "Please select a song (not a folder).")
+            return
+        tid = data.get("track_id")
+        self.play_track(tid)
 
     def on_pause_clicked(self):
         self.engine.pause()
@@ -186,36 +326,36 @@ class MainWindow(QMainWindow):
     def on_stop_clicked(self):
         self.engine.stop()
 
-    def on_device_changed(self, index: int):
-        device_id = self.device_combo.currentData()
-        if not device_id:
-            return
-        # Change ALSA output device in the engine
-        self.engine.set_output_device(device_id)
-        # Optional: update status label
-        self.state_label.setText(f"State: Idle (output: {device_id})")
-        self.state_label.setStyleSheet("color: gray;")
+    def on_device_changed(self, idx: int):
+        dev_id = self.device_combo.currentData()
+        if dev_id:
+            self.engine.set_output_device(dev_id)
+            self.state_label.setText(f"State: Idle (output: {dev_id})")
+            self.state_label.setStyleSheet("color: gray;")
 
     def play_track(self, track_id: int):
         try:
             self.engine.play(track_id)
-        except ValueError as e:
+        except Exception as e:
             QMessageBox.critical(self, "Playback error", str(e))
 
-    # ---------- Status updates ----------
+    # ---------------- Metadata / status ----------------
+    def _clear_metadata(self):
+        self.art_label.setPixmap(QPixmap())
+        self.meta_title.setText("Title: –")
+        self.meta_artist.setText("Artist: –")
+        self.meta_album.setText("Album: –")
+        self.meta_info.setText("Format: –")
 
     def update_status(self):
-        status = self.engine.status()
-        state = status["state"]
-        current_name = status["current_track"]
-
-        # ---- Now Playing label ----
-        if current_name:
-            self.now_playing_label.setText(f"Now Playing: {current_name}")
+        s = self.engine.status()
+        state = s.get("state")
+        cur_name = s.get("current_track")
+        if cur_name:
+            self.now_playing_label.setText(f"Now Playing: {cur_name}")
         else:
             self.now_playing_label.setText("Now Playing: –")
 
-        # ---- State label ----
         if state == PlaybackState.PLAYING:
             self.state_label.setText("State: Playing")
             self.state_label.setStyleSheet("color: #22c55e;")
@@ -226,61 +366,47 @@ class MainWindow(QMainWindow):
             self.state_label.setText("State: Stopped")
             self.state_label.setStyleSheet("color: gray;")
         else:
-            # idle
             if "output:" not in self.state_label.text():
                 self.state_label.setText("State: Idle")
             self.state_label.setStyleSheet("color: gray;")
 
-        # ---- Album art + metadata ----
-        track_id = status.get("current_track_id")
-        if track_id is None:
-            # reset everything when not playing
-            self.art_label.setPixmap(QPixmap())
-            self.meta_title.setText("Title: –")
-            self.meta_artist.setText("Artist: –")
-            self.meta_album.setText("Album: –")
-            self.meta_info.setText("Format: –")
+        tid = s.get("current_track_id")
+        if tid is None:
+            self._clear_metadata()
             return
 
-        # Fetch TrackInfo object
-        track = self.engine.get_track_by_id(track_id)
+        track = self.engine.get_track_by_id(tid)
         if not track:
-            return  # nothing to update
+            return
 
-        # ---- Metadata ----
         self.meta_title.setText(f"Title: {track.title or '–'}")
         self.meta_artist.setText(f"Artist: {track.artist or '–'}")
         self.meta_album.setText(f"Album: {track.album or '–'}")
 
-        # Audio info: sample rate, bit depth, channels
         if track.sample_rate and track.bit_depth and track.channels:
             fmt = f"{track.sample_rate/1000:.1f} kHz | {track.bit_depth}-bit | {track.channels} ch"
         else:
-            fmt = "Format: –"
-
+            fmt = "–"
         self.meta_info.setText(f"Format: {fmt}")
 
-        # ---- Album Art ----
         if track.album_art:
-            qimg = QImage.fromData(track.album_art)
-            pix = QPixmap.fromImage(qimg).scaled(
-                200,
-                200,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.art_label.setPixmap(pix)
+            try:
+                img = QImage.fromData(track.album_art)
+                pix = QPixmap.fromImage(img).scaled(
+                    200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                )
+                self.art_label.setPixmap(pix)
+            except Exception:
+                self.art_label.setPixmap(QPixmap())
         else:
-            # clear art box
             self.art_label.setPixmap(QPixmap())
-
 
 
 def main():
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    w = MainWindow()
+    w.show()
+    app.exec()
 
 
 if __name__ == "__main__":
