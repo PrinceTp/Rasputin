@@ -1,8 +1,22 @@
 # app/audio_engine.py
+"""
+Audio engine for bit-perfect playback via ALSA + soundfile.
+Features:
+ - list ALSA devices (hw: and plughw:)
+ - persist last used alsa device and music dir
+ - non-blocking play() that starts a playback thread (no join() in GUI)
+ - robust ALSA open with backoff retries inside playback thread
+ - integer dtype reads and raw pcm writes (keeps bit-path intact)
+
+This version adds a Qt signal `pcm_chunk` to broadcast copies of PCM blocks
+for a visualization UI. Emission is non-blocking and does not affect the
+actual ALSA write path (we emit a copy).
+"""
 import os
 import glob
 import threading
 import time
+import json
 from typing import List, Optional
 
 import numpy as np
@@ -11,28 +25,32 @@ import alsaaudio
 import mutagen
 from mutagen.flac import FLAC
 
-from .config import MUSIC_DIR, ALSA_CARD, BUFFER_FRAMES
+# Qt import for signaling
+from PyQt6.QtCore import pyqtSignal, QObject
+
+# Defaults (if you have a project config, it will be used)
+try:
+    from .config import MUSIC_DIR, ALSA_CARD, BUFFER_FRAMES
+except Exception:
+    MUSIC_DIR = os.path.expanduser("~/Music")
+    ALSA_CARD = "hw:0,0"
+    BUFFER_FRAMES = 4096
 
 
 class TrackInfo:
-    """
-    Holds path + metadata + album art bytes + reliable duration extraction.
-    """
     def __init__(self, track_id: int, path: str):
         self.id = track_id
         self.path = path
         self.name = os.path.basename(path)
 
-        # Metadata fields (populated by _read_metadata)
+        # metadata
         self.title: Optional[str] = None
         self.artist: Optional[str] = None
         self.album: Optional[str] = None
         self.sample_rate: Optional[int] = None
         self.bit_depth: Optional[int] = None
         self.channels: Optional[int] = None
-        self.duration: Optional[float] = None  # seconds
-
-        # Raw album art bytes (None if missing)
+        self.duration: Optional[float] = None
         self.album_art: Optional[bytes] = None
 
         self._read_metadata()
@@ -41,7 +59,6 @@ class TrackInfo:
         try:
             a = mutagen.File(self.path)
             if a is None:
-                # fallback: set defaults and try soundfile for duration
                 self.title = self.name
                 self.artist = "Unknown Artist"
                 self.album = "Unknown Album"
@@ -75,7 +92,6 @@ class TrackInfo:
                     self.channels = getattr(info, "channels", None)
                     self.bit_depth = getattr(info, "bits_per_sample", None)
 
-                # FLAC embedded art
                 if isinstance(a, FLAC):
                     if a.pictures:
                         try:
@@ -83,7 +99,6 @@ class TrackInfo:
                         except Exception:
                             pass
 
-                # ID3/APIC generic
                 if not self.album_art and tags:
                     apic = tags.get("APIC:")
                     if apic:
@@ -92,7 +107,6 @@ class TrackInfo:
                         except Exception:
                             pass
 
-                # folder fallback
                 if not self.album_art:
                     folder = os.path.dirname(self.path)
                     for candidate in ("cover.jpg", "Cover.jpg", "folder.jpg", "Folder.jpg", "cover.png"):
@@ -104,9 +118,7 @@ class TrackInfo:
                                 break
                             except Exception:
                                 continue
-
         except Exception as e:
-            # non-fatal
             print(f"[audio_engine] Warning: metadata read error {self.path}: {e}", flush=True)
             if not self.title:
                 self.title = self.name
@@ -115,7 +127,7 @@ class TrackInfo:
             if not self.album:
                 self.album = "Unknown Album"
 
-        # Fallback: if duration missing, use soundfile to probe frames/samplerate
+        # fallback: probe with soundfile for duration/sample info
         if self.duration is None:
             try:
                 with sf.SoundFile(self.path) as sfh:
@@ -123,13 +135,11 @@ class TrackInfo:
                     sr = sfh.samplerate
                     if frames and sr:
                         self.duration = frames / float(sr)
-                        # set sample_rate / channels if missing
                         if not self.sample_rate:
                             self.sample_rate = sr
                         if not self.channels:
                             self.channels = sfh.channels
             except Exception:
-                # if even this fails, leave duration None
                 pass
 
 
@@ -140,36 +150,80 @@ class PlaybackState:
     STOPPED = "stopped"
 
 
-class AudioEngine:
+class AudioEngine(QObject):
     """
-    Bit-perfect playback via ALSA + soundfile; dynamic music_dir and ALSA selection.
-    Adds position tracking and seeking support.
+    NOTE: AudioEngine now inherits QObject to support emission of `pcm_chunk` Qt signal.
+    Everything else remains the same as your prior engine.
     """
+    pcm_chunk = pyqtSignal(object)  # emits numpy array (always a copy) for visualizer
+
     def __init__(self, music_dir: str = MUSIC_DIR, alsa_card: str = ALSA_CARD):
+        super().__init__()  # QObject init
         self.music_dir = music_dir
         self.alsa_card = alsa_card
 
         self.tracks: List[TrackInfo] = []
         self.current_track: Optional[TrackInfo] = None
 
+        # thread & control events (per-playback events are created inside play())
         self._playback_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
 
-        # Seeking and position vars (thread-safe via _lock)
-        self._position: float = 0.0         # seconds (updated by playback thread)
-        self._duration: float = 0.0         # seconds (from track)
-        self._seek_to_seconds: Optional[float] = None  # None or seconds target
+        self._seek_to_seconds: Optional[float] = None
         self._seek_lock = threading.Lock()
+
+        self._position: float = 0.0
+        self._duration: float = 0.0
 
         self._state = PlaybackState.IDLE
         self._lock = threading.Lock()
 
+        # load persisted config (may override defaults)
+        try:
+            self._load_config()
+        except Exception:
+            pass
+
+        # build library
         self._scan_library()
 
-    # ---------- Library ----------
+    # ---------- config persistence ----------
+    def _config_path(self) -> str:
+        cfg_dir = os.path.join(os.path.expanduser("~"), ".config", "bitperfect-player")
+        os.makedirs(cfg_dir, exist_ok=True)
+        return os.path.join(cfg_dir, "config.json")
+
+    def _load_config(self):
+        try:
+            p = self._config_path()
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                alsa_card = cfg.get("alsa_card")
+                music_dir = cfg.get("music_dir")
+                if alsa_card:
+                    self.alsa_card = alsa_card
+                if music_dir:
+                    self.music_dir = music_dir
+        except Exception as e:
+            print(f"[audio_engine] Warning: failed to load config: {e}", flush=True)
+
+    def _save_config(self):
+        try:
+            p = self._config_path()
+            cfg = {
+                "alsa_card": self.alsa_card,
+                "music_dir": self.music_dir
+            }
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2)
+        except Exception as e:
+            print(f"[audio_engine] Warning: failed to save config: {e}", flush=True)
+
+    # ---------- library ----------
     def _scan_library(self):
-        patterns = ("*.flac", "*.wav")
+        patterns = ("*.flac", "*.wav", "*.mp3", "*.m4a", "*.aac")
         files = []
         for p in patterns:
             files.extend(glob.glob(os.path.join(self.music_dir, p)))
@@ -187,84 +241,126 @@ class AudioEngine:
         return None
 
     def set_music_dir(self, music_dir: str):
-        self.music_dir = music_dir
+        with self._lock:
+            self.music_dir = music_dir
         self._scan_library()
+        try:
+            self._save_config()
+        except Exception:
+            pass
 
-    # ---------- ALSA ----------
+    # ---------- devices ----------
     def list_alsa_devices(self):
+        """
+        Return list of dicts: {id: <device id>, name: <desc>, hw: True/False}
+        Offers both hw: and plughw: entries where available.
+        """
         devices = []
-        for idx, name in enumerate(alsaaudio.cards()):
-            dev_id = f"hw:{idx},0"
+        try:
+            cards = alsaaudio.cards()
+        except Exception:
+            cards = []
+
+        for idx, card_name in enumerate(cards):
+            label_base = f"{card_name}"
+            hw_id = f"hw:{idx},0"
+            plug_id = f"plughw:{idx},0"
+
             try:
-                alsaaudio.PCM(device=dev_id)
-                devices.append({"id": dev_id, "name": name})
+                pcm = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK, device=hw_id)
+                pcm.close()
+                devices.append({"id": hw_id, "name": f"{label_base} — {hw_id} (Recommended, no conversion)", "hw": True})
             except Exception:
-                continue
+                pass
+
+            try:
+                pcm = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK, device=plug_id)
+                pcm.close()
+                devices.append({"id": plug_id, "name": f"{label_base} — {plug_id} (Fallback, may convert)", "hw": False})
+            except Exception:
+                pass
+
+        if not devices:
+            devices.append({"id": "default", "name": "default (system default)", "hw": False})
         return devices
 
     def set_output_device(self, device_id: str):
         with self._lock:
             self.alsa_card = device_id
+        try:
+            self._save_config()
+        except Exception:
+            pass
 
-    # ---------- Playback ----------
+    # ---------- playback control ----------
     def play(self, track_id: int):
         track = self.get_track_by_id(track_id)
         if not track:
             raise ValueError("Track not found")
 
-        with self._lock:
-            # request stop of any running playback (do NOT join here to avoid blocking GUI)
-            self._stop_event.set()
+        # signal any existing playback threads to stop (do NOT join here)
+        try:
+            old_stop = self._stop_event
+            old_stop.set()
+        except Exception:
+            pass
 
-            # reset stop / pause states & seeking for the new playback
-            self._stop_event.clear()
-            self._pause_event.clear()
+        # create fresh events for new playback
+        stop_event = threading.Event()
+        pause_event = threading.Event()
+
+        with self._lock:
+            self._stop_event = stop_event
+            self._pause_event = pause_event
+
             with self._seek_lock:
                 self._seek_to_seconds = None
 
             self.current_track = track
             self._state = PlaybackState.PLAYING
 
-            # set duration when available
             self._duration = float(track.duration) if (track.duration is not None) else 0.0
             self._position = 0.0
 
             print(f"[audio_engine] Starting playback id={track.id} path={track.path} device={self.alsa_card}", flush=True)
-            # start a new playback thread and do NOT block the caller
-            self._playback_thread = threading.Thread(target=self._playback_loop, args=(track.path,), daemon=True)
+
+            # start playback thread (daemon)
+            self._playback_thread = threading.Thread(
+                target=self._playback_loop,
+                args=(track.path, stop_event, pause_event),
+                daemon=True,
+            )
             self._playback_thread.start()
 
-
     def pause(self):
-        with self._lock:
-            if self._state == PlaybackState.PLAYING:
+        try:
+            with self._lock:
                 self._pause_event.set()
                 self._state = PlaybackState.PAUSED
+        except Exception:
+            pass
 
     def resume(self):
-        with self._lock:
-            if self._state == PlaybackState.PAUSED:
+        try:
+            with self._lock:
                 self._pause_event.clear()
                 self._state = PlaybackState.PLAYING
+        except Exception:
+            pass
 
     def stop(self):
-        with self._lock:
-            self._stop_event.set()
-            self._pause_event.clear()
-            self._state = PlaybackState.STOPPED
-        # Do not join() here from the main thread to avoid UI freeze.
-        # The playback thread will exit on its own and clean up.
+        try:
+            with self._lock:
+                self._stop_event.set()
+                self._pause_event.clear()
+                self._state = PlaybackState.STOPPED
+        except Exception:
+            pass
+        print("[audio_engine] stop() requested: stop_event set", flush=True)
 
-
-    # Seeking API (thread-safe)
     def seek(self, seconds: float):
-        """
-        Request a seek to a position (seconds). This is thread-safe and applied
-        in the playback loop on next iteration.
-        """
         with self._seek_lock:
             self._seek_to_seconds = float(max(0.0, seconds))
-        # update external position immediately for a responsive UI
         with self._lock:
             self._position = float(max(0.0, seconds))
 
@@ -274,18 +370,18 @@ class AudioEngine:
 
     def get_duration(self) -> float:
         with self._lock:
-            # fall back to track info
             if self._duration and self._duration > 0:
                 return float(self._duration)
             if self.current_track and self.current_track.duration:
                 return float(self.current_track.duration)
             return 0.0
 
-    # ---------- Playback loop ----------
+    # ---------- internals: mapping / open / loop ----------
     def _map_subtype_to_alsa_format(self, subtype: str):
         if subtype == "PCM_16":
             return alsaaudio.PCM_FORMAT_S16_LE, np.int16
         elif subtype == "PCM_24":
+            # present as 32-bit container commonly
             return alsaaudio.PCM_FORMAT_S32_LE, np.int32
         elif subtype == "PCM_32":
             return alsaaudio.PCM_FORMAT_S32_LE, np.int32
@@ -301,15 +397,15 @@ class AudioEngine:
         pcm.setperiodsize(BUFFER_FRAMES)
         return pcm
 
-    def _playback_loop(self, path: str):
+    def _playback_loop(self, path: str, stop_event: threading.Event, pause_event: threading.Event):
+        pcm = None
         try:
-            print(f"[audio_engine] Playback loop started for {path}", flush=True)
+            print(f"[audio_engine] Playback loop started for {path} (thread={threading.get_ident()})", flush=True)
+
             with sf.SoundFile(path, mode="r") as f:
                 channels = f.channels
                 samplerate = f.samplerate
                 subtype = f.subtype
-
-                # Set duration & sample metadata (redundant but keeps state accurate)
                 frames_total = getattr(f, "frames", None)
                 if frames_total and samplerate:
                     with self._lock:
@@ -317,42 +413,43 @@ class AudioEngine:
 
                 print(f"[audio_engine] File info: channels={channels}, samplerate={samplerate}, subtype={subtype}", flush=True)
                 alsa_format, np_dtype = self._map_subtype_to_alsa_format(subtype)
-                # try opening ALSA device; if device busy, retry a few times (the retries are inside playback thread)
-                pcm = None
-                max_retries = 6
-                for attempt in range(max_retries):
+
+                # attempt to open ALSA device with backoff (inside playback thread)
+                max_retries = 80
+                base_delay = 0.03
+                for attempt in range(1, max_retries + 1):
+                    if stop_event.is_set():
+                        raise RuntimeError("Stop requested before device open")
                     try:
                         pcm = self._open_alsa_device(channels, samplerate, alsa_format)
                         break
                     except Exception as e:
-                        print(f"[audio_engine] ALSA open failed (attempt {attempt+1}/{max_retries}): {e}", flush=True)
-                        time.sleep(0.05)  # short retry delay - only affects playback thread
+                        wait_time = base_delay * (1 + (attempt // 20))
+                        print(f"[audio_engine] ALSA open failed (attempt {attempt}/{max_retries}): {e}; retry in {wait_time:.3f}s", flush=True)
+                        time.sleep(wait_time)
                 if pcm is None:
                     raise RuntimeError("Unable to open ALSA device for playback")
 
-
-                # Apply any pending seek at start
+                # initial seek if requested
                 with self._seek_lock:
                     seek_secs = self._seek_to_seconds
                     self._seek_to_seconds = None
                 if seek_secs is not None:
-                    target_frame = int(seek_secs * samplerate)
-                    target_frame = max(0, min(target_frame, frames_total or target_frame))
                     try:
+                        target_frame = int(seek_secs * samplerate)
+                        target_frame = max(0, min(target_frame, frames_total or target_frame))
                         f.seek(target_frame)
                         with self._lock:
                             self._position = float(target_frame) / float(samplerate)
                     except Exception as e:
                         print("[audio_engine] seek failed at start:", e, flush=True)
 
-                # Main playback loop
-                while not self._stop_event.is_set():
-                    # handle pause
-                    if self._pause_event.is_set():
+                # main loop
+                while not stop_event.is_set():
+                    if pause_event.is_set():
                         time.sleep(0.05)
                         continue
 
-                    # handle seek requests (from main thread)
                     with self._seek_lock:
                         seek_secs = self._seek_to_seconds
                         self._seek_to_seconds = None
@@ -364,7 +461,6 @@ class AudioEngine:
                             f.seek(target_frame)
                             with self._lock:
                                 self._position = float(target_frame) / float(samplerate)
-                            # continue loop to read from new position
                         except Exception as e:
                             print("[audio_engine] seek error:", e, flush=True)
 
@@ -373,10 +469,21 @@ class AudioEngine:
                         print("[audio_engine] EOF reached", flush=True)
                         break
 
-                    interleaved = data.reshape(-1)
-                    pcm.write(interleaved.tobytes())
+                    # --- VISUALIZER: emit a copy of the PCM chunk (non-blocking) ---
+                    try:
+                        # emit a copy so visualizer can't accidentally modify our buffer
+                        self.pcm_chunk.emit(np.copy(data))
+                    except Exception:
+                        # swallow any signal errors — playback must continue
+                        pass
 
-                    # update position after write
+                    interleaved = data.reshape(-1)
+                    try:
+                        pcm.write(interleaved.tobytes())
+                    except Exception as e:
+                        print(f"[audio_engine] PCM write error: {e}", flush=True)
+                        break
+
                     try:
                         with self._lock:
                             self._position = float(f.tell()) / float(samplerate)
@@ -388,14 +495,28 @@ class AudioEngine:
             print("[audio_engine] ERROR in playback loop:", e, flush=True)
             traceback.print_exc()
         finally:
+            try:
+                if pcm is not None:
+                    try:
+                        pcm.close()
+                        print("[audio_engine] ALSA device closed", flush=True)
+                    except Exception as e:
+                        print(f"[audio_engine] Error while closing ALSA device: {e}", flush=True)
+                    finally:
+                        pcm = None
+            except Exception:
+                pass
+
             with self._lock:
-                if not self._stop_event.is_set():
-                    self._state = PlaybackState.IDLE
-                self.current_track = None
-                self._position = 0.0
+                if self.current_track and self.current_track.path == path:
+                    if not stop_event.is_set():
+                        self._state = PlaybackState.IDLE
+                    self.current_track = None
+                    self._position = 0.0
+
             print("[audio_engine] Playback loop finished", flush=True)
 
-    # ---------- Status ----------
+    # ---------- status ----------
     def status(self) -> dict:
         with self._lock:
             return {

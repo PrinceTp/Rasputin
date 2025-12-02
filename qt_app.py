@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import traceback
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -21,8 +22,12 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QAction, QFont
 
-from app.audio_engine import AudioEngine, PlaybackState  # engine provides seek(), status(), get_track_by_id(), list_tracks()
-# References: audio_engine.py (seek/status/get_duration etc.) and original qt_app layout. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}
+# Import engine from app package
+from app.audio_engine import AudioEngine, PlaybackState
+
+# Visualizer window
+from visualizer_window import VisualizerWindow
+
 
 def format_seconds(sec: Optional[float]) -> str:
     if sec is None:
@@ -37,26 +42,17 @@ def format_seconds(sec: Optional[float]) -> str:
 
 
 class SeekSlider(QSlider):
-    """
-    QSlider subclass that emits a 'clicked' signal with the clicked value
-    so clicks on the slider jump immediately to that position.
-    """
     clicked = pyqtSignal(int)
 
     def mousePressEvent(self, ev):
-        # compute clicked value proportionally to x position
         if ev.button():
             x = ev.position().x() if hasattr(ev, "position") else ev.x()
             w = self.width()
             if w > 0:
-                # clamp ratio 0..1
                 ratio = max(0.0, min(1.0, x / float(w)))
                 val = int(round(self.minimum() + ratio * (self.maximum() - self.minimum())))
-                # set visual
                 self.setValue(val)
-                # emit custom clicked signal (main window will handle seeking)
                 self.clicked.emit(val)
-                # do NOT call super().mousePressEvent(ev) to avoid double-handling
                 return
         super().mousePressEvent(ev)
 
@@ -72,12 +68,14 @@ class MainWindow(QMainWindow):
         self.engine = AudioEngine()
 
         # Seeking state
-        self._seeking = False  # True while user is dragging slider
+        self._seeking = False
         self._seek_preview_seconds: Optional[float] = None
+
+        # Visualizer attribute (created on demand)
+        self.visualizer: Optional[VisualizerWindow] = None
 
         # Widgets
         self.tree = QTreeWidget()
-        # two columns: name, length
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels(["Name", "Length"])
         self.tree.setColumnWidth(0, 450)
@@ -85,7 +83,6 @@ class MainWindow(QMainWindow):
         self.now_playing_label = QLabel("Now Playing: –")
         self.state_label = QLabel("State: Idle")
 
-        # Album art + metadata
         self.art_label = QLabel()
         self.art_label.setFixedSize(200, 200)
         self.art_label.setStyleSheet("background: #111; border: 1px solid #333;")
@@ -96,27 +93,25 @@ class MainWindow(QMainWindow):
         self.meta_album = QLabel("Album: –")
         self.meta_info = QLabel("Format: –")
 
-        # Seek bar + time labels
         self.seek_slider = SeekSlider(Qt.Orientation.Horizontal)
-        self.seek_slider.setRange(0, 1000)  # normalized 0..1000
+        self.seek_slider.setRange(0, 1000)
         self.seek_slider.setSingleStep(1)
         self.time_label_current = QLabel("0:00")
         self.time_label_total = QLabel("0:00")
         self.time_label_current.setFixedWidth(60)
         self.time_label_total.setFixedWidth(60)
 
-        # Device combo + controls (added Prev / Next)
         self.device_combo = QComboBox()
         self.prev_button = QPushButton("Prev")
         self.play_button = QPushButton("Play")
         self.pause_button = QPushButton("Pause")
         self.next_button = QPushButton("Next")
-        self.stop_button = QPushButton("Stop")  # keep stop for convenience
+        self.stop_button = QPushButton("Stop")
 
-        # Menu
+        # NEW: Visualizer button
+        self.visualizer_button = QPushButton("Visualizer")
+
         self._create_menu_bar()
-
-        # Make menu bar bigger / more prominent using stylesheet
         self.menuBar().setStyleSheet("""
             QMenuBar {
                 font-size: 16px;
@@ -137,20 +132,16 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        # Layout
         self._setup_ui()
         self._connect_signals()
 
-        # Load data
         self._load_tracks_tree()
         self._load_devices()
 
-        # Status timer
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_status)
         self.timer.start(500)
 
-    # ---------------- Menu ----------------
     def _create_menu_bar(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
@@ -171,7 +162,6 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
-    # ---------------- UI ----------------
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -179,18 +169,15 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout()
         central.setLayout(main_layout)
 
-        # left: tree
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("Library"))
         left_layout.addWidget(self.tree)
 
-        # right: now playing + art + metadata + device + controls + seek
         right_layout = QVBoxLayout()
         right_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.now_playing_label.setStyleSheet("font-weight: bold;")
         right_layout.addWidget(self.now_playing_label)
-
         self.state_label.setStyleSheet("color: gray;")
         right_layout.addWidget(self.state_label)
 
@@ -200,56 +187,56 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.meta_album)
         right_layout.addWidget(self.meta_info)
 
-        # Seek row: current time | slider | total time
         seek_row = QHBoxLayout()
         seek_row.addWidget(self.time_label_current)
         seek_row.addWidget(self.seek_slider, 1)
         seek_row.addWidget(self.time_label_total)
         right_layout.addLayout(seek_row)
 
+        # device row with refresh button
         dev_row = QHBoxLayout()
         dev_row.addWidget(QLabel("Output device:"))
         dev_row.addWidget(self.device_combo)
+        self.device_refresh_button = QPushButton("Refresh")
+        dev_row.addWidget(self.device_refresh_button)
         right_layout.addLayout(dev_row)
 
-        # Controls row: Prev | Play | Pause | Next | Stop
         ctrl_row = QHBoxLayout()
         ctrl_row.addWidget(self.prev_button)
         ctrl_row.addWidget(self.play_button)
         ctrl_row.addWidget(self.pause_button)
         ctrl_row.addWidget(self.next_button)
         ctrl_row.addWidget(self.stop_button)
+
+        # Add visualizer button to controls row
+        ctrl_row.addWidget(self.visualizer_button)
+
         right_layout.addLayout(ctrl_row)
 
         main_layout.addLayout(left_layout, 2)
         main_layout.addLayout(right_layout, 1)
 
-    # ---------------- Signals ----------------
     def _connect_signals(self):
         self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
         self.play_button.clicked.connect(self.on_play_clicked)
         self.pause_button.clicked.connect(self.on_pause_clicked)
         self.stop_button.clicked.connect(self.on_stop_clicked)
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        self.device_refresh_button.clicked.connect(self._load_devices)
 
-        # new prev/next signals
         self.prev_button.clicked.connect(self.on_prev_clicked)
         self.next_button.clicked.connect(self.on_next_clicked)
 
-        # seek slider signals
         self.seek_slider.sliderPressed.connect(self.on_seek_pressed)
         self.seek_slider.sliderReleased.connect(self.on_seek_released)
         self.seek_slider.sliderMoved.connect(self.on_seek_moved)
-        # handle clicks (jump-to-click)
         self.seek_slider.clicked.connect(self.on_slider_clicked)
 
-    # ---------------- Tree styling helper ----------------
+        # Visualizer button handler
+        self.visualizer_button.clicked.connect(self.on_visualizer_clicked)
+
+    # styling helper
     def style_tree_item(self, item: QTreeWidgetItem, level: int):
-        """
-        level = 0 → top-level folder
-        level = 1 → subfolder
-        level >=2 → files / deeper levels
-        """
         f = QFont()
         if level == 0:
             f.setPointSize(14)
@@ -260,11 +247,9 @@ class MainWindow(QMainWindow):
         else:
             f.setPointSize(10)
             f.setBold(False)
-
         item.setFont(0, f)
         item.setFont(1, f)
 
-    # ---------------- Load / build tree ----------------
     def _load_tracks_tree(self):
         self.tree.clear()
         tracks = self.engine.list_tracks()
@@ -312,24 +297,34 @@ class MainWindow(QMainWindow):
         for i in range(self.tree.topLevelItemCount()):
             self.tree.topLevelItem(i).setExpanded(True)
 
-    # ---------------- Devices ----------------
     def _load_devices(self):
         self.device_combo.clear()
-        devs = self.engine.list_alsa_devices()
+        try:
+            devs = self.engine.list_alsa_devices()
+        except Exception as e:
+            devs = []
+            print("Error listing ALSA devices:", e)
+
         if not devs:
-            self.device_combo.addItem("No ALSA hw devices", userData=None)
+            self.device_combo.addItem("No ALSA devices found", userData=None)
             self.device_combo.setEnabled(False)
             return
-        for d in devs:
-            label = f"{d['name']} ({d['id']})"
-            self.device_combo.addItem(label, userData=d["id"])
-        cur = self.engine.status().get("alsa_card")
-        if cur:
-            idx = self.device_combo.findData(cur)
-            if idx >= 0:
-                self.device_combo.setCurrentIndex(idx)
 
-    # ---------------- Actions ----------------
+        preferred_index = -1
+        for i, d in enumerate(devs):
+            label = d.get("name", d["id"])
+            self.device_combo.addItem(label, userData=d["id"])
+            if d["id"] == getattr(self.engine, "alsa_card", None):
+                preferred_index = i
+
+        if preferred_index >= 0:
+            self.device_combo.setCurrentIndex(preferred_index)
+        else:
+            self.device_combo.setCurrentIndex(0)
+            sel = self.device_combo.currentData()
+            if sel:
+                self.engine.set_output_device(sel)
+
     def on_import_folder(self):
         initial = self.engine.status().get("music_dir") or os.path.expanduser("~")
         folder = QFileDialog.getExistingDirectory(self, "Select primary music folder", initial)
@@ -344,7 +339,10 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet("color: gray;")
 
     def on_rescan(self):
-        self.engine._scan_library()
+        try:
+            self.engine._scan_library()
+        except Exception:
+            pass
         self._load_tracks_tree()
         QMessageBox.information(self, "Rescan", "Library rescan complete.")
 
@@ -360,7 +358,6 @@ class MainWindow(QMainWindow):
     def on_play_clicked(self):
         sel = self.tree.currentItem()
         if not sel:
-            # if nothing selected but a track is loaded and paused, resume
             st = self.engine.status()
             if st.get("current_track_id") is not None and st.get("state") == PlaybackState.PAUSED:
                 self.engine.resume()
@@ -389,14 +386,12 @@ class MainWindow(QMainWindow):
 
     def play_track(self, track_id: int):
         try:
-            # reset seeking preview state
             self._seeking = False
             self._seek_preview_seconds = None
             self.engine.play(track_id)
         except Exception as e:
             QMessageBox.critical(self, "Playback error", str(e))
 
-    # ---------------- Prev/Next ----------------
     def _current_track_index(self) -> Optional[int]:
         st = self.engine.status()
         cur_id = st.get("current_track_id")
@@ -413,7 +408,6 @@ class MainWindow(QMainWindow):
         if not tracks:
             return
         cur_idx = self._current_track_index()
-        # if nothing currently playing, play first selected or first track
         if cur_idx is None:
             sel = self.tree.currentItem()
             if sel:
@@ -421,7 +415,6 @@ class MainWindow(QMainWindow):
                 if data and data.get("type") == "file":
                     self.play_track(data.get("track_id"))
                     return
-            # default to first track
             self.play_track(tracks[0].id)
             return
 
@@ -429,7 +422,6 @@ class MainWindow(QMainWindow):
         if prev_idx != cur_idx:
             self.play_track(tracks[prev_idx].id)
         else:
-            # already at first track: restart it
             self.play_track(tracks[prev_idx].id)
 
     def on_next_clicked(self):
@@ -444,7 +436,6 @@ class MainWindow(QMainWindow):
                 if data and data.get("type") == "file":
                     self.play_track(data.get("track_id"))
                     return
-            # default to first track
             self.play_track(tracks[0].id)
             return
 
@@ -452,13 +443,10 @@ class MainWindow(QMainWindow):
         if next_idx != cur_idx:
             self.play_track(tracks[next_idx].id)
 
-    # ---------------- Seek handlers ----------------
     def on_seek_pressed(self):
-        # user started dragging: stop automatic updates to slider
         self._seeking = True
 
     def on_seek_moved(self, value: int):
-        # slider moved while pressed - show preview time
         s = self.engine.get_duration()
         if s and s > 0:
             frac = value / 1000.0
@@ -469,7 +457,6 @@ class MainWindow(QMainWindow):
             self.time_label_current.setText("–")
 
     def on_seek_released(self):
-        # user released: compute seconds and call engine.seek
         value = self.seek_slider.value()
         s = self.engine.get_duration()
         if s and s > 0:
@@ -481,22 +468,27 @@ class MainWindow(QMainWindow):
         self._seek_preview_seconds = None
 
     def on_slider_clicked(self, slider_value: int):
-        """
-        Handle mouse clicks on the slider: jump immediately to clicked position.
-        slider_value is in the slider's integer range (0..1000).
-        """
         s = self.engine.get_duration()
         if s and s > 0:
             frac = slider_value / 1000.0
             target = frac * s
-            # request seek on engine (thread-safe)
             self.engine.seek(target)
-            # update UI immediately for responsiveness
             self.time_label_current.setText(format_seconds(target))
-            # ensure slider visually matches
             self.seek_slider.setValue(slider_value)
 
-    # ---------------- Metadata / status ----------------
+    def on_visualizer_clicked(self):
+        # create on demand and connect engine signal -> visualizer push_chunk
+        try:
+            if self.visualizer is None:
+                # pass engine so the visualizer can read current sample rate
+                self.visualizer = VisualizerWindow(engine=self.engine)
+                self.engine.pcm_chunk.connect(self.visualizer.push_chunk)
+            self.visualizer.show()
+            self.visualizer.raise_()
+        except Exception as e:
+            QMessageBox.warning(self, "Visualizer error", f"Could not open visualizer: {e}")
+
+
     def _clear_metadata(self):
         self.art_label.setPixmap(QPixmap())
         self.meta_title.setText("Title: –")
@@ -561,20 +553,16 @@ class MainWindow(QMainWindow):
         else:
             self.art_label.setPixmap(QPixmap())
 
-        # --- Seek / time UI updates ---
         pos = s.get("position", 0.0)
         dur = s.get("duration", 0.0)
         if dur is None:
             dur = 0.0
 
-        # update total time label
         self.time_label_total.setText(format_seconds(dur))
 
-        # If user is actively dragging, don't override slider; only update preview label
         if self._seeking:
             return
 
-        # compute normalized slider value
         try:
             if dur > 0:
                 frac = max(0.0, min(1.0, pos / dur))
@@ -587,6 +575,13 @@ class MainWindow(QMainWindow):
             self.time_label_current.setText(format_seconds(pos))
         except Exception:
             pass
+
+    def closeEvent(self, event):
+        try:
+            self.engine.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 def main():
