@@ -15,8 +15,8 @@ from PyQt6.QtWidgets import (
     QComboBox,
 )
 from PyQt6.QtCore import Qt, QTimer
-
-from app.audio_engine import AudioEngine, PlaybackState  # our engine
+from PyQt6.QtGui import QPixmap, QImage
+from app.audio_engine import AudioEngine, PlaybackState 
 
 
 class MainWindow(QMainWindow):
@@ -33,6 +33,17 @@ class MainWindow(QMainWindow):
         self.track_list = QListWidget()
         self.now_playing_label = QLabel("Now Playing: –")
         self.state_label = QLabel("State: Idle")
+
+        # NEW: album art + metadata widgets
+        self.art_label = QLabel()
+        self.art_label.setFixedSize(200, 200)
+        self.art_label.setStyleSheet("background: #111; border: 1px solid #333;")
+        self.art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.meta_title = QLabel("Title: –")
+        self.meta_artist = QLabel("Artist: –")
+        self.meta_album = QLabel("Album: –")
+        self.meta_info = QLabel("Format: –")
 
         # ALSA device selector
         self.device_label = QLabel("Output device:")
@@ -70,7 +81,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("Library"))
         left_layout.addWidget(self.track_list)
 
-        # Right: now playing + device + controls
+        # Right: now playing + art + metadata + device + controls
         right_layout = QVBoxLayout()
         right_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -80,22 +91,28 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet("color: gray;")
         right_layout.addWidget(self.state_label)
 
+        # NEW: album art + metadata block
+        right_layout.addWidget(self.art_label)
+        right_layout.addWidget(self.meta_title)
+        right_layout.addWidget(self.meta_artist)
+        right_layout.addWidget(self.meta_album)
+        right_layout.addWidget(self.meta_info)
+
         # Device selector row
         device_row = QHBoxLayout()
         device_row.addWidget(self.device_label)
         device_row.addWidget(self.device_combo)
         right_layout.addLayout(device_row)
 
-        # Playback controls
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.pause_button)
         controls_layout.addWidget(self.stop_button)
         right_layout.addLayout(controls_layout)
 
-        # Put left + right together
         main_layout.addLayout(left_layout, 2)
         main_layout.addLayout(right_layout, 1)
+
 
     def _connect_signals(self):
         self.track_list.itemDoubleClicked.connect(self.on_track_double_clicked)
@@ -118,7 +135,8 @@ class MainWindow(QMainWindow):
             return
 
         for t in tracks:
-            item = QListWidgetItem(f"[{t.id}] {t.name}")
+            display_name = f"{t.title} — {t.artist}" if t.title else t.name
+            item = QListWidgetItem(display_name)
             item.setData(Qt.ItemDataRole.UserRole, t.id)
             self.track_list.addItem(item)
 
@@ -191,11 +209,13 @@ class MainWindow(QMainWindow):
         state = status["state"]
         current_name = status["current_track"]
 
+        # ---- Now Playing label ----
         if current_name:
             self.now_playing_label.setText(f"Now Playing: {current_name}")
         else:
             self.now_playing_label.setText("Now Playing: –")
 
+        # ---- State label ----
         if state == PlaybackState.PLAYING:
             self.state_label.setText("State: Playing")
             self.state_label.setStyleSheet("color: #22c55e;")
@@ -207,10 +227,53 @@ class MainWindow(QMainWindow):
             self.state_label.setStyleSheet("color: gray;")
         else:
             # idle
-            # don't overwrite device info if we set it in on_device_changed
             if "output:" not in self.state_label.text():
                 self.state_label.setText("State: Idle")
             self.state_label.setStyleSheet("color: gray;")
+
+        # ---- Album art + metadata ----
+        track_id = status.get("current_track_id")
+        if track_id is None:
+            # reset everything when not playing
+            self.art_label.setPixmap(QPixmap())
+            self.meta_title.setText("Title: –")
+            self.meta_artist.setText("Artist: –")
+            self.meta_album.setText("Album: –")
+            self.meta_info.setText("Format: –")
+            return
+
+        # Fetch TrackInfo object
+        track = self.engine.get_track_by_id(track_id)
+        if not track:
+            return  # nothing to update
+
+        # ---- Metadata ----
+        self.meta_title.setText(f"Title: {track.title or '–'}")
+        self.meta_artist.setText(f"Artist: {track.artist or '–'}")
+        self.meta_album.setText(f"Album: {track.album or '–'}")
+
+        # Audio info: sample rate, bit depth, channels
+        if track.sample_rate and track.bit_depth and track.channels:
+            fmt = f"{track.sample_rate/1000:.1f} kHz | {track.bit_depth}-bit | {track.channels} ch"
+        else:
+            fmt = "Format: –"
+
+        self.meta_info.setText(f"Format: {fmt}")
+
+        # ---- Album Art ----
+        if track.album_art:
+            qimg = QImage.fromData(track.album_art)
+            pix = QPixmap.fromImage(qimg).scaled(
+                200,
+                200,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.art_label.setPixmap(pix)
+        else:
+            # clear art box
+            self.art_label.setPixmap(QPixmap())
+
 
 
 def main():

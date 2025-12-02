@@ -13,11 +13,70 @@ import alsaaudio
 from .config import MUSIC_DIR, ALSA_CARD, BUFFER_FRAMES
 
 
+import mutagen
+from mutagen.flac import FLAC
+from mutagen.wavpack import WavPack
+
 class TrackInfo:
     def __init__(self, track_id: int, path: str):
         self.id = track_id
         self.path = path
         self.name = os.path.basename(path)
+
+        # Metadata fields
+        self.title = None
+        self.artist = None
+        self.album = None
+        self.sample_rate = None
+        self.bit_depth = None
+        self.channels = None
+        self.duration = None
+
+        # Raw album art bytes
+        self.album_art = None
+
+        self._read_metadata()
+
+    def _read_metadata(self):
+        try:
+            audio = mutagen.File(self.path)
+
+            if audio is None:
+                return
+
+            # Generic tags
+            self.title = audio.tags.get("TITLE", [self.name])[0] if hasattr(audio, "tags") else self.name
+            self.artist = audio.tags.get("ARTIST", ["Unknown Artist"])[0] if hasattr(audio, "tags") else "Unknown Artist"
+            self.album = audio.tags.get("ALBUM", ["Unknown Album"])[0] if hasattr(audio, "tags") else "Unknown Album"
+
+            # Audio properties
+            self.sample_rate = getattr(audio.info, "sample_rate", None)
+            self.channels = getattr(audio.info, "channels", None)
+            self.duration = getattr(audio.info, "length", None)
+
+            # Bit depth is file-specific
+            if isinstance(audio, FLAC):
+                self.bit_depth = audio.info.bits_per_sample
+                # Album art in FLAC pictures
+                if audio.pictures:
+                    self.album_art = audio.pictures[0].data
+
+            elif isinstance(audio, WavPack):
+                self.bit_depth = audio.info.bits_per_sample
+                # WavPack doesn’t embed art commonly
+
+            # Fallback: try folder.jpg or cover.jpg
+            if not self.album_art:
+                folder = os.path.dirname(self.path)
+                for candidate in ["cover.jpg", "folder.jpg", "Cover.jpg", "Folder.jpg"]:
+                    img_path = os.path.join(folder, candidate)
+                    if os.path.exists(img_path):
+                        with open(img_path, "rb") as f:
+                            self.album_art = f.read()
+                            break
+
+        except Exception as e:
+            print(f"[WARN] Failed to read metadata for {self.path}: {e}")
 
 
 class PlaybackState:
