@@ -11,6 +11,11 @@ Features:
 This version adds a Qt signal `pcm_chunk` to broadcast copies of PCM blocks
 for a visualization UI. Emission is non-blocking and does not affect the
 actual ALSA write path (we emit a copy).
+
+This version also tracks a conservative "bit-perfect" flag based on:
+ - using an explicit hw: ALSA device
+ - integer PCM subtype (PCM_16 / PCM_24 / PCM_32)
+The flag is exposed via status() as `bitperfect` and `bitperfect_reason`.
 """
 import os
 import glob
@@ -154,6 +159,9 @@ class AudioEngine(QObject):
     """
     NOTE: AudioEngine now inherits QObject to support emission of `pcm_chunk` Qt signal.
     Everything else remains the same as your prior engine.
+
+    This version also keeps track of a conservative "bit-perfect" flag for the
+    current playback session.
     """
     pcm_chunk = pyqtSignal(object)  # emits numpy array (always a copy) for visualizer
 
@@ -178,6 +186,10 @@ class AudioEngine(QObject):
 
         self._state = PlaybackState.IDLE
         self._lock = threading.Lock()
+
+        # Bit-perfect status (per-playback)
+        self._bitperfect: bool = False
+        self._bitperfect_reason: str = "Idle"
 
         # load persisted config (may override defaults)
         try:
@@ -322,6 +334,10 @@ class AudioEngine(QObject):
             self._duration = float(track.duration) if (track.duration is not None) else 0.0
             self._position = 0.0
 
+            # reset bit-perfect flags for new playback; will be set in _playback_loop
+            self._bitperfect = False
+            self._bitperfect_reason = "Opening device"
+
             print(f"[audio_engine] Starting playback id={track.id} path={track.path} device={self.alsa_card}", flush=True)
 
             # start playback thread (daemon)
@@ -354,6 +370,9 @@ class AudioEngine(QObject):
                 self._stop_event.set()
                 self._pause_event.clear()
                 self._state = PlaybackState.STOPPED
+                # when explicitly stopped, clear bit-perfect state
+                self._bitperfect = False
+                self._bitperfect_reason = "Stopped"
         except Exception:
             pass
         print("[audio_engine] stop() requested: stop_event set", flush=True)
@@ -375,6 +394,42 @@ class AudioEngine(QObject):
             if self.current_track and self.current_track.duration:
                 return float(self.current_track.duration)
             return 0.0
+
+    # ---------- internals: bit-perfect tracking ----------
+    def _set_bitperfect_state(
+        self,
+        file_samplerate: int,
+        file_channels: int,
+        file_subtype: str,
+        alsa_device: Optional[str],
+        alsa_format,
+    ) -> None:
+        """
+        Conservative bit-perfect check.
+
+        We mark playback as bit-perfect if:
+          - ALSA device is an explicit 'hw:' device,
+          - File subtype is integer PCM we pass directly (PCM_16 / PCM_24 / PCM_32).
+
+        Any resampling or format conversion beyond that would be outside
+        this engine (e.g., driver/OS), but this matches the typical
+        "bit-perfect pipeline" for ALSA.
+        """
+        with self._lock:
+            self._bitperfect = False
+            self._bitperfect_reason = ""
+
+            if not alsa_device or not alsa_device.startswith("hw:"):
+                self._bitperfect_reason = "Using non-hw ALSA device (likely mixed/resampled)"
+                return
+
+            if file_subtype not in ("PCM_16", "PCM_24", "PCM_32"):
+                self._bitperfect_reason = f"Unsupported or non-integer subtype: {file_subtype}"
+                return
+
+            # All conditions met: pipeline is configured for bit-perfect playback.
+            self._bitperfect = True
+            self._bitperfect_reason = ""
 
     # ---------- internals: mapping / open / loop ----------
     def _map_subtype_to_alsa_format(self, subtype: str):
@@ -428,7 +483,24 @@ class AudioEngine(QObject):
                         print(f"[audio_engine] ALSA open failed (attempt {attempt}/{max_retries}): {e}; retry in {wait_time:.3f}s", flush=True)
                         time.sleep(wait_time)
                 if pcm is None:
+                    with self._lock:
+                        self._bitperfect = False
+                        self._bitperfect_reason = "Unable to open ALSA device"
                     raise RuntimeError("Unable to open ALSA device for playback")
+
+                # We now know file format + ALSA device; compute bit-perfect state.
+                try:
+                    self._set_bitperfect_state(
+                        file_samplerate=samplerate,
+                        file_channels=channels,
+                        file_subtype=subtype,
+                        alsa_device=self.alsa_card,
+                        alsa_format=alsa_format,
+                    )
+                except Exception as e:
+                    with self._lock:
+                        self._bitperfect = False
+                        self._bitperfect_reason = f"Bit-perfect check failed: {e!r}"
 
                 # initial seek if requested
                 with self._seek_lock:
@@ -494,6 +566,10 @@ class AudioEngine(QObject):
             import traceback
             print("[audio_engine] ERROR in playback loop:", e, flush=True)
             traceback.print_exc()
+            with self._lock:
+                self._bitperfect = False
+                if not self._bitperfect_reason:
+                    self._bitperfect_reason = "Playback error"
         finally:
             try:
                 if pcm is not None:
@@ -513,6 +589,9 @@ class AudioEngine(QObject):
                         self._state = PlaybackState.IDLE
                     self.current_track = None
                     self._position = 0.0
+                    # when idle with no current track, clear bit-perfect state
+                    self._bitperfect = False
+                    self._bitperfect_reason = "Idle"
 
             print("[audio_engine] Playback loop finished", flush=True)
 
@@ -527,4 +606,6 @@ class AudioEngine(QObject):
                 "music_dir": self.music_dir,
                 "position": float(self._position),
                 "duration": float(self._duration),
+                "bitperfect": bool(self._bitperfect),
+                "bitperfect_reason": self._bitperfect_reason,
             }

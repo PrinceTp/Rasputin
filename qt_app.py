@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import sys
 import os
-import traceback
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -22,11 +21,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QAction, QFont
 
-# Import engine from app package
+# Engine
 from app.audio_engine import AudioEngine, PlaybackState
 
-# Visualizer window
-from visualizer_window import VisualizerWindow
+# Visualizer (if present)
+try:
+    from visualizer_window import VisualizerWindow
+except ImportError:
+    VisualizerWindow = None
 
 
 def format_seconds(sec: Optional[float]) -> str:
@@ -71,8 +73,8 @@ class MainWindow(QMainWindow):
         self._seeking = False
         self._seek_preview_seconds: Optional[float] = None
 
-        # Visualizer attribute (created on demand)
-        self.visualizer: Optional[VisualizerWindow] = None
+        # Optional visualizer window
+        self.visualizer: Optional["VisualizerWindow"] = None
 
         # Widgets
         self.tree = QTreeWidget()
@@ -82,6 +84,7 @@ class MainWindow(QMainWindow):
 
         self.now_playing_label = QLabel("Now Playing: –")
         self.state_label = QLabel("State: Idle")
+        self.bitperfect_label = QLabel("Bit-perfect: Unknown")
 
         self.art_label = QLabel()
         self.art_label.setFixedSize(200, 200)
@@ -96,23 +99,40 @@ class MainWindow(QMainWindow):
         self.seek_slider = SeekSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 1000)
         self.seek_slider.setSingleStep(1)
+
         self.time_label_current = QLabel("0:00")
         self.time_label_total = QLabel("0:00")
         self.time_label_current.setFixedWidth(60)
         self.time_label_total.setFixedWidth(60)
 
         self.device_combo = QComboBox()
+        self.device_refresh_button = QPushButton("Refresh")
+
         self.prev_button = QPushButton("Prev")
         self.play_button = QPushButton("Play")
         self.pause_button = QPushButton("Pause")
         self.next_button = QPushButton("Next")
         self.stop_button = QPushButton("Stop")
 
-        # NEW: Visualizer button
         self.visualizer_button = QPushButton("Visualizer")
 
         self._create_menu_bar()
-        self.menuBar().setStyleSheet("""
+        self._setup_ui()
+        self._connect_signals()
+
+        self._load_tracks_tree()
+        self._load_devices()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_status)
+        self.timer.start(500)
+
+    # ---------------- menu / UI setup ----------------
+
+    def _create_menu_bar(self):
+        menubar = self.menuBar()
+
+        menubar.setStyleSheet("""
             QMenuBar {
                 font-size: 16px;
                 padding: 6px 12px;
@@ -132,18 +152,6 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        self._setup_ui()
-        self._connect_signals()
-
-        self._load_tracks_tree()
-        self._load_devices()
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_status)
-        self.timer.start(500)
-
-    def _create_menu_bar(self):
-        menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
 
         import_action = QAction("Import folder", self)
@@ -169,10 +177,12 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout()
         central.setLayout(main_layout)
 
+        # Left: tree
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("Library"))
         left_layout.addWidget(self.tree)
 
+        # Right: info + controls
         right_layout = QVBoxLayout()
         right_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -180,6 +190,9 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.now_playing_label)
         self.state_label.setStyleSheet("color: gray;")
         right_layout.addWidget(self.state_label)
+
+        self.bitperfect_label.setStyleSheet("color: #f97316;")
+        right_layout.addWidget(self.bitperfect_label)
 
         right_layout.addWidget(self.art_label)
         right_layout.addWidget(self.meta_title)
@@ -193,11 +206,9 @@ class MainWindow(QMainWindow):
         seek_row.addWidget(self.time_label_total)
         right_layout.addLayout(seek_row)
 
-        # device row with refresh button
         dev_row = QHBoxLayout()
         dev_row.addWidget(QLabel("Output device:"))
         dev_row.addWidget(self.device_combo)
-        self.device_refresh_button = QPushButton("Refresh")
         dev_row.addWidget(self.device_refresh_button)
         right_layout.addLayout(dev_row)
 
@@ -207,10 +218,7 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(self.pause_button)
         ctrl_row.addWidget(self.next_button)
         ctrl_row.addWidget(self.stop_button)
-
-        # Add visualizer button to controls row
         ctrl_row.addWidget(self.visualizer_button)
-
         right_layout.addLayout(ctrl_row)
 
         main_layout.addLayout(left_layout, 2)
@@ -218,24 +226,25 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
+
         self.play_button.clicked.connect(self.on_play_clicked)
         self.pause_button.clicked.connect(self.on_pause_clicked)
         self.stop_button.clicked.connect(self.on_stop_clicked)
-        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
-        self.device_refresh_button.clicked.connect(self._load_devices)
-
         self.prev_button.clicked.connect(self.on_prev_clicked)
         self.next_button.clicked.connect(self.on_next_clicked)
+
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        self.device_refresh_button.clicked.connect(self._load_devices)
 
         self.seek_slider.sliderPressed.connect(self.on_seek_pressed)
         self.seek_slider.sliderReleased.connect(self.on_seek_released)
         self.seek_slider.sliderMoved.connect(self.on_seek_moved)
         self.seek_slider.clicked.connect(self.on_slider_clicked)
 
-        # Visualizer button handler
         self.visualizer_button.clicked.connect(self.on_visualizer_clicked)
 
-    # styling helper
+    # ---------------- tree + devices ----------------
+
     def style_tree_item(self, item: QTreeWidgetItem, level: int):
         f = QFont()
         if level == 0:
@@ -265,6 +274,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 rel = t.path
             parts = rel.split(os.sep)
+
             parent = None
             path_acc = base
             for i, part in enumerate(parts[:-1]):
@@ -287,7 +297,11 @@ class MainWindow(QMainWindow):
             name = parts[-1]
             length = format_seconds(t.duration)
             file_item = QTreeWidgetItem([name, length])
-            file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "file", "track_id": t.id, "path": t.path})
+            file_item.setData(
+                0,
+                Qt.ItemDataRole.UserRole,
+                {"type": "file", "track_id": t.id, "path": t.path},
+            )
             self.style_tree_item(file_item, level=2)
             if parent is None:
                 self.tree.addTopLevelItem(file_item)
@@ -302,8 +316,8 @@ class MainWindow(QMainWindow):
         try:
             devs = self.engine.list_alsa_devices()
         except Exception as e:
-            devs = []
             print("Error listing ALSA devices:", e)
+            devs = []
 
         if not devs:
             self.device_combo.addItem("No ALSA devices found", userData=None)
@@ -325,6 +339,8 @@ class MainWindow(QMainWindow):
             if sel:
                 self.engine.set_output_device(sel)
 
+    # ---------------- menu actions ----------------
+
     def on_import_folder(self):
         initial = self.engine.status().get("music_dir") or os.path.expanduser("~")
         folder = QFileDialog.getExistingDirectory(self, "Select primary music folder", initial)
@@ -337,6 +353,8 @@ class MainWindow(QMainWindow):
         self._clear_metadata()
         self.state_label.setText(f"State: Idle (library: {folder})")
         self.state_label.setStyleSheet("color: gray;")
+        self.bitperfect_label.setText("Bit-perfect: Unknown")
+        self.bitperfect_label.setStyleSheet("color: #f97316;")
 
     def on_rescan(self):
         try:
@@ -345,6 +363,8 @@ class MainWindow(QMainWindow):
             pass
         self._load_tracks_tree()
         QMessageBox.information(self, "Rescan", "Library rescan complete.")
+
+    # ---------------- playback actions ----------------
 
     def on_tree_double_click(self, item: QTreeWidgetItem, col: int):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -383,6 +403,8 @@ class MainWindow(QMainWindow):
             self.engine.set_output_device(dev_id)
             self.state_label.setText(f"State: Idle (output: {dev_id})")
             self.state_label.setStyleSheet("color: gray;")
+            self.bitperfect_label.setText("Bit-perfect: Unknown")
+            self.bitperfect_label.setStyleSheet("color: #f97316;")
 
     def play_track(self, track_id: int):
         try:
@@ -419,10 +441,7 @@ class MainWindow(QMainWindow):
             return
 
         prev_idx = max(0, cur_idx - 1)
-        if prev_idx != cur_idx:
-            self.play_track(tracks[prev_idx].id)
-        else:
-            self.play_track(tracks[prev_idx].id)
+        self.play_track(tracks[prev_idx].id)
 
     def on_next_clicked(self):
         tracks = self.engine.list_tracks()
@@ -440,8 +459,9 @@ class MainWindow(QMainWindow):
             return
 
         next_idx = min(len(tracks) - 1, cur_idx + 1)
-        if next_idx != cur_idx:
-            self.play_track(tracks[next_idx].id)
+        self.play_track(tracks[next_idx].id)
+
+    # ---------------- seek slider ----------------
 
     def on_seek_pressed(self):
         self._seeking = True
@@ -476,11 +496,15 @@ class MainWindow(QMainWindow):
             self.time_label_current.setText(format_seconds(target))
             self.seek_slider.setValue(slider_value)
 
+    # ---------------- visualizer ----------------
+
     def on_visualizer_clicked(self):
-        # create on demand and connect engine signal -> visualizer push_chunk
+        if VisualizerWindow is None:
+            QMessageBox.warning(self, "Visualizer", "visualizer_window.py not found.")
+            return
+
         try:
             if self.visualizer is None:
-                # pass engine so the visualizer can read current sample rate
                 self.visualizer = VisualizerWindow(engine=self.engine)
                 self.engine.pcm_chunk.connect(self.visualizer.push_chunk)
             self.visualizer.show()
@@ -488,6 +512,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Visualizer error", f"Could not open visualizer: {e}")
 
+    # ---------------- status / metadata ----------------
 
     def _clear_metadata(self):
         self.art_label.setPixmap(QPixmap())
@@ -503,6 +528,8 @@ class MainWindow(QMainWindow):
         s = self.engine.status()
         state = s.get("state")
         cur_name = s.get("current_track")
+
+        # Now playing / state
         if cur_name:
             self.now_playing_label.setText(f"Now Playing: {cur_name}")
         else:
@@ -522,6 +549,25 @@ class MainWindow(QMainWindow):
                 self.state_label.setText("State: Idle")
             self.state_label.setStyleSheet("color: gray;")
 
+        # Bit-perfect indicator
+        bitperfect = s.get("bitperfect", False)
+        reason = s.get("bitperfect_reason", "")
+
+        if bitperfect:
+            self.bitperfect_label.setText("Bit-perfect: YES")
+            self.bitperfect_label.setStyleSheet("color: #22c55e;")
+        else:
+            if state in (PlaybackState.IDLE, None) and not s.get("current_track_id"):
+                self.bitperfect_label.setText("Bit-perfect: Unknown")
+                self.bitperfect_label.setStyleSheet("color: #f97316;")
+            else:
+                if reason:
+                    self.bitperfect_label.setText(f"Bit-perfect: NO ({reason})")
+                else:
+                    self.bitperfect_label.setText("Bit-perfect: NO")
+                self.bitperfect_label.setStyleSheet("color: #f97316;")
+
+        # Metadata / time / slider
         tid = s.get("current_track_id")
         if tid is None:
             self._clear_metadata()
@@ -545,7 +591,10 @@ class MainWindow(QMainWindow):
             try:
                 img = QImage.fromData(track.album_art)
                 pix = QPixmap.fromImage(img).scaled(
-                    200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                    200,
+                    200,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
                 )
                 self.art_label.setPixmap(pix)
             except Exception:
@@ -554,9 +603,7 @@ class MainWindow(QMainWindow):
             self.art_label.setPixmap(QPixmap())
 
         pos = s.get("position", 0.0)
-        dur = s.get("duration", 0.0)
-        if dur is None:
-            dur = 0.0
+        dur = s.get("duration", 0.0) or 0.0
 
         self.time_label_total.setText(format_seconds(dur))
 
@@ -575,6 +622,8 @@ class MainWindow(QMainWindow):
             self.time_label_current.setText(format_seconds(pos))
         except Exception:
             pass
+
+    # ---------------- close ----------------
 
     def closeEvent(self, event):
         try:
